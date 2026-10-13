@@ -175,7 +175,7 @@ async def main():
                 add("WARN", f"{tag}: realtime 3D/canvas aanwezig", "menselijke check op echte Mac nodig: vloeiend, geen sprong, gelijk aan poster")
             if path == "/":
                 og = d["ogImage"] or ""
-                add("PASS" if og and "screenshot" not in og and "lovable" not in og else "FAIL", "OG-afbeelding eigen bestand", og[:80])
+                add("PASS" if og and not any(x in og for x in ("screenshot", "lovable.dev", "gpt-engineer", "opengraph-image")) else "FAIL", "OG-afbeelding eigen bestand", og[:80])
                 add("PASS" if d["icons"] and not any("lovable" in i for i in d["icons"]) else "FAIL", "eigen favicon", ", ".join(d["icons"])[:80])
                 add("PASS" if d["tel"] or d["mail"] else "WARN", "klikbaar telefoonnummer of e-mail")
 
