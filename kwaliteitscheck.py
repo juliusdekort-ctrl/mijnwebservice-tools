@@ -76,6 +76,13 @@ PAGE_JS = r"""
     icons: [...document.querySelectorAll('link[rel*=icon]')].map(l => l.href),
     canvas: document.querySelectorAll('canvas').length,
     tel: !!document.querySelector('a[href^="tel:"]'), mail: !!document.querySelector('a[href^="mailto:"]'),
+    lang: document.documentElement.getAttribute('lang') || '',
+    viewport: !!document.querySelector('meta[name="viewport"]'),
+    noAlt: [...document.images].filter(vis).filter(i => i.getBoundingClientRect().width > 120 && !i.hasAttribute('alt')).map(i => (i.currentSrc || i.src).split('/').pop().slice(0, 50)),
+    badInputs: [...document.querySelectorAll('input')].filter(i => {
+      const n = ((i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '')).toLowerCase(); const t = (i.type || 'text').toLowerCase();
+      return (/(tel|telefoon|phone)/.test(n) && t !== 'tel') || (/(e-?mail)/.test(n) && t !== 'email');
+    }).map(i => i.name || i.id),
   };
 }
 """
@@ -102,8 +109,43 @@ async def main():
             add("PASS" if blocked else "FAIL", "robots.txt blokkeert alles (demo)", robots_txt.strip()[:80])
         else:
             add("FAIL" if blocked else "PASS", "robots.txt laat Google toe (oplevering)", robots_txt.strip()[:80])
-            s = await req.get(base + "/sitemap.xml")
-            add("PASS" if s.ok and "<urlset" in (await s.text()) else "FAIL", "sitemap.xml bestaat")
+            sm = re.search(r"(?im)^\s*sitemap:\s*(\S+)", robots_txt)
+            sm_url = base + urlparse(sm.group(1)).path if sm else base + "/sitemap.xml"
+            s = await req.get(sm_url)
+            s_body = (await s.text()) if s.ok else ""
+            if "<sitemapindex" in s_body:  # WordPress en andere sitemap-indexen: eerste deel-sitemap volgen
+                first = re.search(r"<loc>\s*([^<\s]+)", s_body)
+                if first:
+                    s = await req.get(base + urlparse(first.group(1)).path)
+            add("PASS" if s.ok and "<urlset" in (await s.text()) else "FAIL", "sitemap bestaat", sm_url.replace(base, "") or "/")
+        if a.modus == "oplevering":
+            # zoekmachines en AI-zoekbots mogen niet geblokkeerd zijn
+            blocks = {}
+            agent = None
+            for line in robots_txt.splitlines():
+                l = line.split("#")[0].strip()
+                if l.lower().startswith("user-agent:"): agent = l.split(":", 1)[1].strip().lower()
+                elif l.lower().startswith("disallow:") and l.split(":", 1)[1].strip() == "/" and agent: blocks[agent] = True
+            geblokt = [b for b in ("googlebot", "bingbot", "oai-searchbot", "applebot") if blocks.get(b)]
+            add("FAIL" if geblokt else "PASS", "zoekmachines en AI-zoekbots niet geblokkeerd in robots.txt", ", ".join(geblokt))
+            add("PASS" if re.search(r"(?im)^\s*sitemap:", robots_txt) else "WARN", "robots.txt verwijst naar de sitemap")
+            s_txt = (await s.text()) if s.ok else ""
+            locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", s_txt)[:30]
+            wrong_host = [u for u in locs if urlparse(u).netloc and urlparse(u).netloc != host and not base.startswith("http://localhost") and not base.startswith("http://127.")]
+            add("WARN" if wrong_host else "PASS", "sitemap gebruikt hetzelfde domein", ", ".join(wrong_host[:3]))
+        if base.startswith("https://"):
+            hr_ = await req.get("http://" + host + "/", max_redirects=0)
+            loc = hr_.headers.get("location", "")
+            add("PASS" if hr_.status in (301, 308) and loc.startswith("https://") else ("WARN" if hr_.status in (302, 307) else "FAIL"),
+                "http stuurt door naar https", f"{hr_.status} {loc}")
+        # niet-bestaande pagina moet een echte 404 geven
+        nf = await req.get(base + "/deze-pagina-bestaat-niet-kwaliteitscheck")
+        nf_txt = await nf.text()
+        add("PASS" if nf.status == 404 else "FAIL", "niet-bestaande pagina geeft een 404", str(nf.status))
+        # ruwe HTML: precies één html-document en één title
+        raw = await (await req.get(base + "/")).text()
+        n_html, n_title = len(re.findall(r"<html[\s>]", raw, re.I)), len(re.findall(r"<title[\s>]", raw, re.I))
+        add("PASS" if n_html <= 1 and n_title <= 1 else "FAIL", "homepage is één HTML-document met één title", f"html {n_html}, title {n_title}")
         fav = await req.get(base + "/favicon.ico")
         add("PASS" if fav.ok and "html" not in (fav.headers.get("content-type", "")) else "WARN", "/favicon.ico bestaat")
 
@@ -139,6 +181,7 @@ async def main():
             add("FAIL" if hr["overlaps"] else "PASS", f"{w}px: geen tekst over beeld in de hero", "; ".join(hr["overlaps"]))
 
         # per pagina
+        all_links, titles = set(), {}
         for path in paths:
             url = base + path
             closing.add(page); await page.close()
@@ -169,6 +212,14 @@ async def main():
             add("FAIL" if d["labels"] > 1 else "PASS", f"{tag}: hooguit één label boven een kop", str(d["labels"]))
             soft = [f'{i["src"]} {i["natural"]}px voor {i["shown"]}px' for i in d["imgs"] if i["complete"] and i["natural"] and i["natural"] < 1.9 * i["shown"]]
             add("WARN" if soft else "PASS", f"{tag}: beelden minstens 2x weergavebreedte", "; ".join(soft[:4]))
+            all_links.update(h for h in d["links"] if h and h.startswith("/") and not h.startswith("//"))
+            titles.setdefault(d["title"], []).append(path)
+            add("PASS" if d["lang"].lower().startswith("nl") else "WARN", f"{tag}: paginataal Nederlands", d["lang"])
+            add("PASS" if d["viewport"] else "FAIL", f"{tag}: viewport-meta aanwezig")
+            add("FAIL" if d["noAlt"] else "PASS", f"{tag}: alt-tekst op inhoudelijke afbeeldingen", ", ".join(d["noAlt"][:4]))
+            add("WARN" if d["badInputs"] else "PASS", f"{tag}: juiste invoertype voor telefoon en e-mail", ", ".join(d["badInputs"][:4]))
+            if d["description"] and not (70 <= len(d["description"]) <= 170):
+                add("WARN", f"{tag}: lengte meta description", f'{len(d["description"])} tekens (richtlijn 70 tot 165)')
             empty = [h for h in d["links"] if h in ("#", "", "javascript:void(0)")]
             add("FAIL" if empty else "PASS", f"{tag}: geen lege links", str(len(empty)))
             if d["canvas"]:
@@ -179,9 +230,11 @@ async def main():
                 add("PASS" if d["icons"] and not any("lovable" in i for i in d["icons"]) else "FAIL", "eigen favicon", ", ".join(d["icons"])[:80])
                 add("PASS" if d["tel"] or d["mail"] else "WARN", "klikbaar telefoonnummer of e-mail")
 
-        # interne links bestaan
+        dubbel = {t: p for t, p in titles.items() if t and len(p) > 1}
+        add("WARN" if dubbel else "PASS", "elke pagina een unieke title", "; ".join(f'"{t[:40]}" op {", ".join(p)}' for t, p in list(dubbel.items())[:3]))
+        # interne links bestaan (van alle gecontroleerde pagina's)
         dead = []
-        for h in {h for h in home["links"] if h and h.startswith("/") and not h.startswith("//")}:
+        for h in sorted(all_links | {h for h in home["links"] if h and h.startswith("/") and not h.startswith("//")}):
             rr = await req.get(base + h.split("#")[0])
             if rr.status >= 400: dead.append(f"{h} ({rr.status})")
         add("FAIL" if dead else "PASS", "geen dode interne links", ", ".join(dead))
