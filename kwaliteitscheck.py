@@ -144,6 +144,22 @@ async def main():
         add("PASS" if nf.status == 404 else "FAIL", "niet-bestaande pagina geeft een 404", str(nf.status))
         # ruwe HTML: precies één html-document en één title
         raw = await (await req.get(base + "/")).text()
+        # inhoud zonder JavaScript: Bing en veel AI-bots voeren geen JavaScript uit
+        raw_txt = re.sub(r"(?is)<script.*?</script>|<style.*?</style>|<noscript.*?</noscript>", " ", raw)
+        raw_txt = re.sub(r"<[^>]+>", " ", raw_txt)
+        raw_words = len(raw_txt.split())
+        raw_h1 = bool(re.search(r"<h1[\s>]", raw, re.I))
+        ok_raw = raw_h1 and raw_words >= 150
+        add("PASS" if ok_raw else ("FAIL" if a.modus == "oplevering" else "WARN"),
+            "tekst en H1 staan in de HTML zonder JavaScript", f"{raw_words} woorden, H1 {'ja' if raw_h1 else 'nee'}")
+        # www en zonder www: één vaste variant met een permanente doorverwijzing
+        if base.startswith("https://") and not host.startswith("www."):
+            try:
+                wr = await req.get("https://www." + host + "/", max_redirects=0)
+                wl = wr.headers.get("location", "")
+                add("PASS" if wr.status in (301, 308) else "WARN", "www stuurt permanent door (301)", f"{wr.status} {wl}")
+            except Exception as e:
+                add("WARN", "www stuurt permanent door (301)", f"www niet bereikbaar: {str(e)[:60]}")
         n_html, n_title = len(re.findall(r"<html[\s>]", raw, re.I)), len(re.findall(r"<title[\s>]", raw, re.I))
         add("PASS" if n_html <= 1 and n_title <= 1 else "FAIL", "homepage is één HTML-document met één title", f"html {n_html}, title {n_title}")
         fav = await req.get(base + "/favicon.ico")
